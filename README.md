@@ -497,6 +497,7 @@ In the interactive CLI prompt mode you must specify the target image using the `
 - `--path-perms` - Set path permissions/user/group in optimized image (format: `target:octalPermFlags#uid#gid` ; see the non-default USER FAQ section for more details)
 - `--path-perms-file` - File with path permissions to set (format: `target:octalPermFlags#uid#gid` ; see the non-default USER FAQ section for more details)
 - `--exclude-pattern` - Exclude path pattern ([Glob/Match in Go](https://golang.org/pkg/path/filepath/#Match) and `**`) from image (useful when `--include-path` keeps a directory and you need to exclude / filter out some of the files in that directory)
+- `--filter-rules-file` - File with include/exclude filter rules (one rule per line; use `include <pattern>` or `exclude <pattern>`; a bare pattern is an exclude)
 - `--exclude-varlock-files` - Exclude the files in the var and run lock directory (default value: true)
 - `--exclude-mounts` - Exclude mounted volumes from image (default value: true)
 - `--label` - Override or add LABEL analyzing image at runtime [can use this flag multiple times]
@@ -555,6 +556,41 @@ In the interactive CLI prompt mode you must specify the target image using the `
 In the interactive CLI prompt mode you must specify the target image using the `--target` flag while in the traditional CLI mode you can use the `--target` flag or you can specify the target image as the last value in the command.
 
 The `--include-path` option is useful if you want to customize your minified image adding extra files and directories. The `--include-path-file` option allows you to load multiple includes from a newline delimited file. Use this option if you have a lot of includes. The includes from `--include-path` and `--include-path-file` are combined together. You can also use the `--exclude-pattern` flag to control what shouldn't be included.
+
+#### Include/exclude filter rules
+
+`--exclude-pattern` and `--include-path` are combined into one rule set and resolved with the following documented semantics (use `--filter-rules-file` to keep both kinds of rules in one file).
+
+**Matching semantics**
+
+- Paths and patterns are absolute, slash-separated container paths. Relative patterns are resolved against the container root (`/`), never against the process working directory.
+- A rule that matches a directory also applies to everything below it.
+- `*` matches any sequence of characters except `/`; `**` matches any sequence including `/`; `?` matches exactly one character except `/`.
+- Character sets: `[abc]`, ranges `[a-z]`, and negation with either `[^...]` or `[!...]`; `{a,b}` alternation and `\x` escaping are supported.
+- Dot files participate in wildcard matching (`/app/*` matches `/app/.env`).
+- A pattern ending in `/` is a directory-only rule; it does not match a regular file of the same name, but it still covers the directory's contents.
+- A pattern ending in `/**` covers the anchor directory itself as well as its descendants, including when the anchor contains wildcards (`/opt/*/lib/**` covers `/opt/foo/lib`).
+
+**Conflict resolution**
+
+When several rules match a path, the most specific one wins: more literal leading path segments, then more literal characters, then fewer `**` segments, then more segments. If still tied, a rule matching the path itself wins over a rule matching only an ancestor, then an include wins over an exclude (to reduce accidental deletion). Remaining ties are broken deterministically by the pattern text, so rule order never changes the result.
+
+Typical configurations:
+
+```
+--exclude-pattern '/var/log/**' --include-path '/var/log/app/keep.log'   # keep one file from the log dir
+--include-path /app --exclude-pattern '/app/testdata/**' --exclude-pattern '/app/docs'  # drop tests/docs
+```
+
+Every decision can be explained in the debug log, including which rule won and why.
+
+**Dependency completion**
+
+Shared library dependencies of kept executables (`--include-bin`, `--include-exe`, `--include-dir-bins`) are added automatically. An explicit exclude wins over automatic completion: the library is left out and a warning says it was excluded and the program may fail to run. Missing libraries and per-library resolver failures are reported and skipped, never aborting the rest of the completion.
+
+**Legacy semantics**
+
+The pre-existing behavior is available with the `SLIM_FILTER_LEGACY_SEMANTICS=1` environment variable: any matching exclude removes the path, includes never override excludes, patterns are matched verbatim without normalization or ancestor propagation, and dependency completion ignores excludes. Rule sets that only contain exclude patterns produce the same results under both modes, except that the new mode also applies a directory rule to that directory's contents (previously undefined).
 
 The `--continue-after` option is useful if you need to script the Slim app. If you pick the `probe` option then Slim will continue executing the build command after the HTTP probe is done executing. If you pick the `exec` options then Slim will continue executing the build command after the container exec shell commands (specified using the `--exec-file` or `--exec` flags) are done executing. If you pick the `timeout` option Slim will allow the target container to run for 60 seconds before it will attempt to collect the artifacts. You can specify a custom timeout value by passing a number of seconds you need instead of the `timeout` string. If you pick the `signal` option you'll need to send a `USR1` signal to the Slim app process. The `signal` option is useful when you want to run your own tests against the temporary container Slim creates. Your test automation / CI/CD pipeline will be able to notify the Slim app that it's done running its test by sending the `USR1` to it.
 

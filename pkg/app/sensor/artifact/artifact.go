@@ -30,6 +30,8 @@ import (
 	"github.com/slimtoolkit/slim/pkg/report"
 	"github.com/slimtoolkit/slim/pkg/sysidentity"
 	"github.com/slimtoolkit/slim/pkg/system"
+	"github.com/slimtoolkit/slim/pkg/util/filter"
+	"github.com/slimtoolkit/slim/pkg/util/filter/depclosure"
 	"github.com/slimtoolkit/slim/pkg/util/fsutil"
 )
 
@@ -300,10 +302,66 @@ func (a *processor) ArtifactsDir() string {
 	return a.artifactsDirName
 }
 
+// compileFilterRules builds a rule set from raw exclude patterns and include
+// paths. discoveredIncludes adds implicitly discovered include paths.
+//
+// When legacy is true the returned set uses the verbatim legacy matcher; when
+// it is nil (not requested) the caller keeps the pre-existing pattern loops.
+func compileFilterRules(excludes []string, includes []string, discovered map[string]bool, legacy bool) *filter.RuleSet {
+	rules := make([]filter.Rule, 0, len(excludes)+len(includes)+len(discovered)+8)
+	for _, xpattern := range excludes {
+		rules = append(rules, filter.Rule{Pattern: xpattern, Action: filter.Exclude, Source: "exclude-pattern"})
+	}
+
+	for _, iPath := range includes {
+		rules = append(rules, filter.Rule{Pattern: iPath, Action: filter.Include, Source: "include-path"})
+	}
+
+	for iPath := range discovered {
+		rules = append(rules, filter.Rule{Pattern: iPath, Action: filter.Include, Source: "discovered"})
+	}
+
+	rs, errs := filter.CompileLenient(rules, filter.Options{Legacy: legacy})
+	for _, err := range errs {
+		log.Debugf("compileFilterRules: skipping malformed rule - %v", err)
+	}
+
+	return rs
+}
+
+// enumerationRules builds the rule set used to skip paths while enumerating
+// the original filesystem. It is an optimization only, so it is built from the
+// exclude patterns alone. In legacy mode it returns nil, and the caller keeps
+// the exact pre-existing pattern loop.
+func (a *processor) enumerationRules(excludes []string) *filter.RuleSet {
+	if filter.LegacyModeFromEnv() || len(excludes) == 0 {
+		return nil
+	}
+
+	rules := make([]filter.Rule, 0, len(excludes))
+	for _, xpattern := range excludes {
+		rules = append(rules, filter.Rule{Pattern: xpattern, Action: filter.Exclude})
+	}
+
+	rs, errs := filter.CompileLenient(rules, filter.Options{})
+	for _, err := range errs {
+		log.Debugf("GetCurrentPaths: skipping malformed exclude rule - %v", err)
+	}
+
+	return rs
+}
+
 func (a *processor) GetCurrentPaths(root string, excludes []string) (map[string]struct{}, error) {
 	logger := log.WithField("op", "processor.GetCurrentPaths")
 	logger.Trace("call")
 	defer logger.Trace("exit")
+
+	// The enumeration skip is only an optimization (it avoids walking huge
+	// excluded mounts). It must never hide a path that a later include rule
+	// could keep, so a directory is only skipped when the compiled rule set
+	// proves that no include can match below it. Legacy mode keeps the exact
+	// pre-existing "any matching exclude skips the subtree" behavior.
+	rules := a.enumerationRules(excludes)
 
 	pathMap := map[string]struct{}{}
 	err := filepath.Walk(root,
@@ -323,15 +381,26 @@ func (a *processor) GetCurrentPaths(root string, excludes []string) (map[string]
 				return filepath.SkipDir
 			}
 
-			// Optimization: Exclude folders early on to prevent slow enumerat
+			// Optimization: Exclude folders early on to prevent slow enumeration.
 			//               Can help with mounting big folders from the host.
 			// TODO: Combine this logic with the similar logic in findSymlinks().
-			for _, xpattern := range excludes {
-				if match, _ := doublestar.Match(xpattern, pth); match {
-					if info.Mode().IsDir() {
+			if rules != nil {
+				decision := rules.Decide(pth, info.IsDir())
+				if !decision.Keep {
+					if info.Mode().IsDir() && decision.PruneDir {
 						return filepath.SkipDir
 					}
+
 					return nil
+				}
+			} else {
+				for _, xpattern := range excludes {
+					if match, _ := doublestar.Match(xpattern, pth); match {
+						if info.Mode().IsDir() {
+							return filepath.SkipDir
+						}
+						return nil
+					}
 				}
 			}
 
@@ -456,7 +525,13 @@ func (a *processor) Process(
 	}
 
 	logger.Debugf("len(fanReport.ProcessFiles)=%v / fileCount=%v", len(fanReport.ProcessFiles), fileCount)
-	allFilesMap := findSymlinks(fileList, mountPoint, cmd.Excludes)
+
+	var symlinkRules *filter.RuleSet
+	if !filter.LegacyModeFromEnv() {
+		symlinkRules = compileFilterRules(cmd.Excludes, getKeys(cmd.Includes), nil, false)
+	}
+
+	allFilesMap := findSymlinks(fileList, mountPoint, cmd.Excludes, symlinkRules)
 	return saveResults(a.origPathMap, a.artifactsDirName, cmd, allFilesMap, fanReport, ptReport, peReport, a.seReport)
 }
 
@@ -546,6 +621,10 @@ type store struct {
 	saFileMap     map[string]*report.ArtifactProps
 	cmd           *command.StartMonitor
 	appStacks     map[string]*appStackInfo
+	// rules is the compiled include/exclude rule set. It is built lazily from
+	// cmd.Excludes (and the include-driven rules registered during the walk)
+	// so a single compiled form serves the whole artifact pass.
+	rules *filter.RuleSet
 }
 
 func newStore(
@@ -954,6 +1033,125 @@ func getRecordsWithPerms(m map[string]*fsutil.AccessInfo) map[string]*fsutil.Acc
 	return perms
 }
 
+// buildArtifactRules compiles the include/exclude rule set used to filter the
+// collected artifacts.
+//
+// cmd.Excludes (including the internal /opt/_slim and var/run lock exclusions
+// added by saveArtifacts) become exclude rules, cmd.Includes become include
+// rules, and implicitly discovered include paths are added after the artifact
+// walk. Because the engine resolves conflicts by specificity, the historical
+// behavior for exclude-only rule sets is unchanged, while the previously
+// undefined boundaries (an include overriding a parent exclude) now have a
+// documented result.
+func (p *store) buildArtifactRules(excludePatterns []string, discoveredIncludes map[string]bool) *filter.RuleSet {
+	legacy := filter.LegacyModeFromEnv()
+	if legacy {
+		log.Infof("artifact filtering uses the legacy matching semantics (%s is set)", filter.EnvLegacySemantics)
+	}
+
+	// include-bin, include-dir-bins and include-exe entries are deliberately
+	// not include rules here: their targets are handled by the dependency
+	// completion path. The executable itself is always kept, and the
+	// dependencies are evaluated against the exclude rules only, matching the
+	// pre-existing behavior.
+	rs := compileFilterRules(excludePatterns, getKeys(p.cmd.Includes), discoveredIncludes, legacy)
+
+	log.Debugf("artifact filtering: compiled %d rules (legacy=%v)", rs.Size(), legacy)
+
+	return rs
+}
+
+// shouldKeepArtifact applies the compiled filter to one path. It returns true
+// when the path must be kept.
+func (p *store) shouldKeepArtifact(pth string, isDir bool) bool {
+	if p.rules == nil {
+		return true
+	}
+
+	decision := p.rules.Decide(pth, isDir)
+	if !decision.Keep {
+		log.Debugf("artifact filtering: excluding %s - %s", pth, decision.Explanation)
+	}
+
+	return decision.Keep
+}
+
+// resolveExeNames turns include-exe entries (names or absolute paths) into
+// absolute paths.
+func (p *store) resolveExeNames(names []string) []string {
+	paths := make([]string, 0, len(names))
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+
+		if strings.HasPrefix(name, "/") {
+			paths = append(paths, name)
+			continue
+		}
+
+		exePath, err := exec.LookPath(name)
+		if err != nil {
+			log.Debugf("resolveExeNames: executable not found - %s (%v)", name, err)
+			continue
+		}
+
+		paths = append(paths, exePath)
+	}
+
+	return paths
+}
+
+// copyDependencyClosure resolves and copies the shared library dependencies of
+// the given executables.
+//
+// The dependency closure is filtered with the same compiled rule set as the
+// rest of the artifacts, so an explicit exclude always wins over automatic
+// completion. A dependency removed that way is reported with a warning (the
+// target may fail to run). Missing libraries and per-library resolver failures
+// are reported and skipped; they never abort the closure of other libraries.
+func (p *store) copyDependencyClosure(hints depclosure.Hints) {
+	if p.rules == nil {
+		return
+	}
+
+	rules := p.rules
+	if filter.LegacyModeFromEnv() {
+		// Pre-existing behavior: dependency completion never consulted the
+		// exclude patterns. Keep it that way under the legacy switch.
+		permissive, err := filter.Compile(nil, filter.Options{})
+		if err != nil {
+			log.Debugf("saveArtifacts - could not build permissive rule set: %v", err)
+			return
+		}
+
+		rules = permissive
+	}
+
+	result := depclosure.Compute(hints, depclosure.Options{
+		Rules:   rules,
+		Resolve: sodeps.AllDependencies,
+	})
+
+	for _, warning := range result.Warnings {
+		log.Warnf("saveArtifacts - %s", warning)
+	}
+
+	log.Debugf("saveArtifacts - dependency closure: %d libs, %d excluded, %d missing",
+		len(result.Paths), len(result.Excluded), len(result.Missing))
+
+	for _, depPath := range result.Paths {
+		if artifact.IsFilteredPath(depPath) {
+			continue
+		}
+
+		dstPath := fmt.Sprintf("%s/files%s", p.storeLocation, depPath)
+		if err := fsutil.CopyFile(p.cmd.KeepPerms, depPath, dstPath, true); err != nil {
+			log.Debugf("saveArtifacts - CopyFile(%v,%v) error: %v", depPath, dstPath, err)
+		}
+	}
+}
+
 // copied from dockerimage.go
 func linkTargetToFullPath(fullPath, target string) string {
 	if filepath.IsAbs(target) {
@@ -969,7 +1167,7 @@ func linkTargetToFullPath(fullPath, target string) string {
 	return filepath.Clean(filepath.Join(d, target))
 }
 
-func (p *store) saveWorkdir(excludePatterns []string) {
+func (p *store) saveWorkdir() {
 	if p.cmd.IncludeWorkdir == "" {
 		return
 	}
@@ -994,7 +1192,11 @@ func (p *store) saveWorkdir(excludePatterns []string) {
 
 	log.Debugf("sensor.store.saveWorkdir: workdir=%s", p.cmd.IncludeWorkdir)
 
-	err, errs := fsutil.CopyDir(p.cmd.KeepPerms, p.cmd.IncludeWorkdir, dstPath, true, true, excludePatterns, nil, nil)
+	err, errs := fsutil.CopyDirFiltered(p.cmd.KeepPerms, p.cmd.IncludeWorkdir, dstPath, true, true,
+		p.rules, nil, nil,
+		func(prunedPath string, decision filter.Decision) {
+			log.Debugf("sensor.store.saveWorkdir: skipping excluded directory %s - %s", prunedPath, decision.Explanation)
+		})
 	if err != nil {
 		log.Debugf("sensor.store.saveWorkdir: CopyDir(%v,%v) error: %v", p.cmd.IncludeWorkdir, dstPath, err)
 	}
@@ -1716,6 +1918,13 @@ func (p *store) saveArtifacts() {
 	}
 	log.Debugf("saveArtifacts - merged newPerms(%v): %+v", len(newPerms), newPerms)
 
+	// Compile the filter rules once for the whole artifact pass. Includes that
+	// are discovered during the walk (framework and package directories) are
+	// merged into includePaths; the rule set is rebuilt from includePaths after
+	// the discovery pass so those directories participate in precedence.
+	discoveredIncludes := map[string]bool{}
+	p.rules = p.buildArtifactRules(excludePatterns, discoveredIncludes)
+
 	//moved to prepareEnv
 	//dstRootPath := filepath.Join(p.storeLocation, app.ArtifactFilesDirName)
 	//log.Debugf("saveArtifacts - prep file artifacts root dir - '%s'", dstRootPath)
@@ -1740,17 +1949,8 @@ func (p *store) saveArtifacts() {
 			return false
 		}
 
-		for _, xpattern := range excludePatterns {
-			found, err := doublestar.Match(xpattern, linkName)
-			if err != nil {
-				log.Debugf("saveArtifacts.symlinkWalk - copy links - [%v] excludePatterns Match error - %v\n", linkName, err)
-				//should only happen when the pattern is malformed
-				return false
-			}
-			if found {
-				log.Debugf("saveArtifacts.symlinkWalk - copy links - [%v] - excluding (%s) ", linkName, xpattern)
-				return false
-			}
+		if !p.shouldKeepArtifact(linkName, false) {
+			return false
 		}
 
 		//TODO: review
@@ -1835,17 +2035,8 @@ copyFiles:
 			continue
 		}
 
-		for _, xpattern := range excludePatterns {
-			found, err := doublestar.Match(xpattern, srcFileName)
-			if err != nil {
-				log.Debugf("saveArtifacts - copy files - [%v] excludePatterns Match error - %v\n", srcFileName, err)
-				//should only happen when the pattern is malformed
-				continue
-			}
-			if found {
-				log.Debugf("saveArtifacts - copy files - [%v] - excluding (%s) ", srcFileName, xpattern)
-				continue copyFiles
-			}
+		if !p.shouldKeepArtifact(srcFileName, false) {
+			continue copyFiles
 		}
 
 		//filter out pid files (todo: have a flag to enable/disable these capabilities)
@@ -2126,20 +2317,21 @@ copyFiles:
 		///////////////////
 	}
 
+	// Discovered includes were registered in includePaths during the walk
+	// above. Rebuild the rule set so they take part in conflict resolution.
+	if len(includePaths) > 0 {
+		for iPath := range includePaths {
+			discoveredIncludes[iPath] = true
+		}
+
+		p.rules = p.buildArtifactRules(excludePatterns, discoveredIncludes)
+	}
+
 	log.Debugf("saveArtifacts[bsa] - copy files (%v)", len(p.saFileMap))
 copyBsaFiles:
 	for srcFileName := range p.saFileMap {
-		for _, xpattern := range excludePatterns {
-			found, err := doublestar.Match(xpattern, srcFileName)
-			if err != nil {
-				log.Debugf("saveArtifacts[bsa] - copy files - [%v] excludePatterns Match error - %v\n", srcFileName, err)
-				//should only happen when the pattern is malformed
-				continue
-			}
-			if found {
-				log.Debugf("saveArtifacts[bsa] - copy files - [%v] - excluding (%s) ", srcFileName, xpattern)
-				continue copyBsaFiles
-			}
+		if !p.shouldKeepArtifact(srcFileName, false) {
+			continue copyBsaFiles
 		}
 
 		dstFilePath := fmt.Sprintf("%s/files%s", p.storeLocation, srcFileName)
@@ -2199,22 +2391,17 @@ copyIncludes:
 			continue
 		}
 
-		for _, xpattern := range excludePatterns {
-			found, err := doublestar.Match(xpattern, inPath)
-			if err != nil {
-				log.Debugf("saveArtifacts - copy includes - [%v] excludePatterns Match error - %v\n", inPath, err)
-				//should only happen when the pattern is malformed
-				continue
-			}
-			if found {
-				log.Debugf("saveArtifacts - copy includes - [%v] - excluding (%s) ", inPath, xpattern)
-				continue copyIncludes
-			}
+		if !p.shouldKeepArtifact(inPath, isDir) {
+			continue copyIncludes
 		}
 
 		dstPath := fmt.Sprintf("%s/files%s", p.storeLocation, inPath)
 		if isDir {
-			err, errs := fsutil.CopyDir(p.cmd.KeepPerms, inPath, dstPath, true, true, excludePatterns, nil, nil)
+			err, errs := fsutil.CopyDirFiltered(p.cmd.KeepPerms, inPath, dstPath, true, true,
+				p.rules, nil, nil,
+				func(prunedPath string, decision filter.Decision) {
+					log.Debugf("saveArtifacts - skipping excluded directory %s - %s", prunedPath, decision.Explanation)
+				})
 			if err != nil {
 				log.Debugf("CopyDir(%v,%v) error: %v", inPath, dstPath, err)
 			}
@@ -2229,22 +2416,10 @@ copyIncludes:
 		}
 	}
 
-	for _, exePath := range p.cmd.IncludeExes {
-		exeArtifacts, err := sodeps.AllExeDependencies(exePath, true)
-		if err != nil {
-			log.Debugf("saveArtifacts - %v - error getting exe artifacts => %v", exePath, err)
-			continue
-		}
-
-		log.Debugf("saveArtifacts - include exe [%s]: artifacts (%d):\n%v\n",
-			exePath, len(exeArtifacts), strings.Join(exeArtifacts, "\n"))
-
-		for _, apath := range exeArtifacts {
-			dstPath := fmt.Sprintf("%s/files%s", p.storeLocation, apath)
-			if err := fsutil.CopyFile(p.cmd.KeepPerms, apath, dstPath, true); err != nil {
-				log.Debugf("CopyFile(%v,%v) error: %v", apath, dstPath, err)
-			}
-		}
+	if len(p.cmd.IncludeExes) > 0 {
+		p.copyDependencyClosure(depclosure.Hints{
+			Executables: p.resolveExeNames(p.cmd.IncludeExes),
+		})
 	}
 
 	binPathMap := map[string]struct{}{}
@@ -2264,17 +2439,8 @@ addExtraBinIncludes:
 			continue
 		}
 
-		for _, xpattern := range excludePatterns {
-			found, err := doublestar.Match(xpattern, inPath)
-			if err != nil {
-				log.Debugf("saveArtifacts - includeDirBinsList - [%s] excludePatterns Match error - %v\n", inPath, err)
-				//should only happen when the pattern is malformed
-				continue
-			}
-			if found {
-				log.Debugf("saveArtifacts - includeDirBinsList - [%s] - excluding (%s) ", inPath, xpattern)
-				continue addExtraBinIncludes
-			}
+		if !p.shouldKeepArtifact(inPath, true) {
+			continue addExtraBinIncludes
 		}
 
 		err := filepath.Walk(inPath,
@@ -2294,16 +2460,15 @@ addExtraBinIncludes:
 					return filepath.SkipDir
 				}
 
-				// Optimization: Exclude folders early on to prevent slow enumerat
+				// Optimization: Exclude folders early on to prevent slow enumeration.
 				//               Can help with mounting big folders from the host.
 				// TODO: Combine this logic with the similar logic in findSymlinks().
-				for _, xpattern := range excludePatterns {
-					if match, _ := doublestar.Match(xpattern, pth); match {
-						if info.Mode().IsDir() {
-							return filepath.SkipDir
-						}
-						return nil
+				if !p.shouldKeepArtifact(pth, info.IsDir()) {
+					if info.Mode().IsDir() {
+						return filepath.SkipDir
 					}
+
+					return nil
 				}
 
 				if err != nil {
@@ -2338,41 +2503,22 @@ addExtraBinIncludes:
 		}
 	}
 
-copyBinIncludes:
+	binClosure := make([]string, 0, len(binPathMap))
 	for binPath := range binPathMap {
 		if artifact.IsFilteredPath(binPath) {
 			log.Debugf("saveArtifacts - skipping filtered include bin - %s", binPath)
 			continue
 		}
 
-		for _, xpattern := range excludePatterns {
-			found, err := doublestar.Match(xpattern, binPath)
-			if err != nil {
-				log.Debugf("saveArtifacts - copy bin includes - [%v] excludePatterns Match error - %v\n", binPath, err)
-				//should only happen when the pattern is malformed
-				continue
-			}
-			if found {
-				log.Debugf("saveArtifacts - copy bin includes - [%v] - excluding (%s) ", binPath, xpattern)
-				continue copyBinIncludes
-			}
-		}
-
-		binArtifacts, err := sodeps.AllDependencies(binPath)
-		if err != nil {
-			log.Debugf("saveArtifacts - %v - error getting bin artifacts => %v", binPath, err)
+		if !p.shouldKeepArtifact(binPath, false) {
 			continue
 		}
 
-		log.Debugf("saveArtifacts - include bin [%s]: artifacts (%d):\n%v",
-			binPath, len(binArtifacts), strings.Join(binArtifacts, "\n"))
+		binClosure = append(binClosure, binPath)
+	}
 
-		for _, bpath := range binArtifacts {
-			dstPath := fmt.Sprintf("%s/files%s", p.storeLocation, bpath)
-			if err := fsutil.CopyFile(p.cmd.KeepPerms, bpath, dstPath, true); err != nil {
-				log.Debugf("CopyFile(%v,%v) error: %v", bpath, dstPath, err)
-			}
-		}
+	if len(binClosure) > 0 {
+		p.copyDependencyClosure(depclosure.Hints{Executables: binClosure})
 	}
 
 	if p.cmd.IncludeShell {
@@ -2393,7 +2539,7 @@ copyBinIncludes:
 
 	}
 
-	p.saveWorkdir(excludePatterns)
+	p.saveWorkdir()
 
 	p.saveSSHClient()
 	p.saveOSLibsNetwork()
@@ -3310,7 +3456,7 @@ func list2map(l []string) map[string]bool {
 	return m
 }
 
-func findSymlinks(files []string, mountPoint string, excludes []string) map[string]*report.ArtifactProps {
+func findSymlinks(files []string, mountPoint string, excludes []string, rules *filter.RuleSet) map[string]*report.ArtifactProps {
 	log.Debugf("findSymlinks(%v,%v)", len(files), mountPoint)
 
 	result := map[string]*report.ArtifactProps{}
@@ -3419,14 +3565,27 @@ func findSymlinks(files []string, mountPoint string, excludes []string) map[stri
 
 			// Optimization: Avoid walking excluded folders. Supposed to help with
 			//               mounting big folders from the host (they should be explicitly
-			//               excluded).
+			//               excluded). With a compiled rule set, a directory is only
+			//               skipped when no include rule can match below it, so include
+			//               exceptions keep working.
 			// TODO: Combine this logic with the similar logic in GetCurrentPaths().
-			for _, xpattern := range excludes {
-				if match, _ := doublestar.Match(xpattern, fullName); match {
-					if fileInfo.Mode().IsDir() {
+			if rules != nil {
+				decision := rules.Decide(fullName, fileInfo.IsDir())
+				if !decision.Keep {
+					if fileInfo.IsDir() && decision.PruneDir {
 						return filepath.SkipDir
 					}
+
 					return nil
+				}
+			} else {
+				for _, xpattern := range excludes {
+					if match, _ := doublestar.Match(xpattern, fullName); match {
+						if fileInfo.Mode().IsDir() {
+							return filepath.SkipDir
+						}
+						return nil
+					}
 				}
 			}
 

@@ -111,6 +111,9 @@ const (
 	FlagExcludePattern      = "exclude-pattern"
 	FlagExcludePatternUsage = "Exclude path pattern (Glob/Match in Go and **) from image"
 
+	FlagFilterRulesFile      = "filter-rules-file"
+	FlagFilterRulesFileUsage = "File with include/exclude filter rules (one rule per line; use 'include <pattern>' or 'exclude <pattern>'; a bare pattern is an exclude)"
+
 	FlagExcludeVarLockFiles      = "exclude-varlock-files"
 	FlagExcludeVarLockFilesUsage = "Exclude the files in the var and run lock directory"
 	//NOTES:
@@ -458,6 +461,12 @@ var Flags = map[string]cli.Flag{
 		Value:   cli.NewStringSlice(),
 		Usage:   FlagExcludePatternUsage,
 		EnvVars: []string{"DSLIM_EXCLUDE_PATTERN"},
+	},
+	FlagFilterRulesFile: &cli.StringFlag{
+		Name:    FlagFilterRulesFile,
+		Value:   "",
+		Usage:   FlagFilterRulesFileUsage,
+		EnvVars: []string{"DSLIM_FILTER_RULES_FILE"},
 	},
 	FlagExcludeVarLockFiles: &cli.BoolFlag{
 		Name:    FlagExcludeVarLockFiles, //true by default

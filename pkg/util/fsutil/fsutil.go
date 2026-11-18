@@ -17,6 +17,7 @@ import (
 
 	"github.com/slimtoolkit/slim/pkg/pdiscover"
 	"github.com/slimtoolkit/slim/pkg/util/errutil"
+	"github.com/slimtoolkit/slim/pkg/util/filter"
 
 	"github.com/bmatcuk/doublestar"
 	log "github.com/sirupsen/logrus"
@@ -812,7 +813,8 @@ func copyFileObjectHandler(
 	clone bool,
 	srcBase, dstBase string,
 	copyRelPath, skipErrors bool,
-	excludePatterns []string, ignoreDirNames, ignoreFileNames map[string]struct{},
+	judge func(string, bool) walkVerdict,
+	ignoreDirNames, ignoreFileNames map[string]struct{},
 	errs *[]error) filepath.WalkFunc {
 	var foCount uint64
 
@@ -831,19 +833,12 @@ func copyFileObjectHandler(
 
 		foBase := filepath.Base(path)
 
-		var isIgnored bool
-		for _, xpattern := range excludePatterns {
-			found, err := doublestar.Match(xpattern, path)
-			if err != nil {
-				log.Warnf("copyFileObjectHandler - [%v] excludePatterns Match error - %v\n", path, err)
-				//should only happen when the pattern is malformed
-				continue
-			}
-			if found {
-				isIgnored = true
-				break
-			}
+		var verdict walkVerdict
+		if judge != nil {
+			verdict = judge(path, info.Mode().IsDir())
 		}
+
+		isIgnored := verdict.Exclude
 		/*
 			if _, ok := ignorePaths[path]; ok {
 				isIgnored = true
@@ -867,8 +862,15 @@ func copyFileObjectHandler(
 		switch {
 		case info.Mode().IsDir():
 			if isIgnored {
-				log.Debugf("dir path (%v) is ignored (skipping dir)...", path)
-				return filepath.SkipDir
+				if verdict.PruneDir {
+					log.Debugf("dir path (%v) is ignored (skipping dir)...", path)
+					return filepath.SkipDir
+				}
+
+				// The directory is excluded, but an include rule can still
+				// match below it. Keep walking; the directory itself is
+				// created below as a container for the included paths.
+				log.Debugf("dir path (%v) is excluded, but includes may apply below it (walking)", path)
 			}
 
 			//todo: refactor
@@ -1053,6 +1055,119 @@ func CopyDir(clone bool,
 	ignoreFileNames map[string]struct{}) (error, []error) {
 	log.Debugf("CopyDir(%v,%v,%v,%v,%#v,...)", src, dst, copyRelPath, skipErrors, excludePatterns)
 
+	return copyDir(clone, src, dst, copyRelPath, skipErrors,
+		excludeJudge(excludePatterns), ignoreDirNames, ignoreFileNames)
+}
+
+// CopyDirFiltered copies a directory applying a compiled filter rule set.
+//
+// Excluded directories are skipped early when the rule set reports that no
+// include rule can match anything below them, which keeps walks over very
+// large trees cheap. Each verdict is also available through onPrune for
+// diagnostics; it may be nil.
+func CopyDirFiltered(clone bool,
+	src string,
+	dst string,
+	copyRelPath bool,
+	skipErrors bool,
+	rules *filter.RuleSet,
+	ignoreDirNames map[string]struct{},
+	ignoreFileNames map[string]struct{},
+	onPrune func(path string, decision filter.Decision)) (error, []error) {
+	log.Debugf("CopyDirFiltered(%v,%v,%v,%v,...)", src, dst, copyRelPath, skipErrors)
+
+	judge := ruleSetJudge(rules)
+	if onPrune != nil && judge != nil {
+		innerJudge := judge
+		judge = func(p string, isDir bool) walkVerdict {
+			verdict := innerJudge(p, isDir)
+			if verdict.PruneDir && verdict.Decision != nil {
+				onPrune(p, *verdict.Decision)
+			}
+
+			return verdict
+		}
+	}
+
+	return copyDir(clone, src, dst, copyRelPath, skipErrors,
+		judge, ignoreDirNames, ignoreFileNames)
+}
+
+// walkVerdict is what the copy walker needs to know about one path.
+type walkVerdict struct {
+	// Exclude removes the path from the copy.
+	Exclude bool
+	// PruneDir may only be set for a directory that is excluded and that no
+	// include rule can reach; the walker then skips the whole subtree.
+	PruneDir bool
+	// Decision is the full filter decision when a rule set produced it.
+	Decision *filter.Decision
+}
+
+// excludeJudge adapts the legacy exclude pattern list to the walker judge. It
+// preserves the pre-existing behavior: any match excludes the path, and an
+// excluded directory is skipped together with its contents.
+func excludeJudge(excludePatterns []string) func(string, bool) walkVerdict {
+	if len(excludePatterns) == 0 {
+		return nil
+	}
+
+	return func(path string, isDir bool) walkVerdict {
+		for _, xpattern := range excludePatterns {
+			found, err := doublestar.Match(xpattern, path)
+			if err != nil {
+				log.Warnf("copyFileObjectHandler - [%v] excludePatterns Match error - %v\n", path, err)
+				//should only happen when the pattern is malformed
+				continue
+			}
+
+			if found {
+				return walkVerdict{Exclude: true, PruneDir: isDir}
+			}
+		}
+
+		return walkVerdict{}
+	}
+}
+
+// ruleSetJudge adapts a compiled filter rule set to the walker judge. Excluded
+// directories are only pruned when the rule set proves that no include rule
+// can match below them, so include rules with deeper anchors still work inside
+// an otherwise excluded tree.
+func ruleSetJudge(rules *filter.RuleSet) func(string, bool) walkVerdict {
+	if rules == nil {
+		return nil
+	}
+
+	return func(path string, isDir bool) walkVerdict {
+		decision := rules.Decide(path, isDir)
+		if decision.Keep {
+			return walkVerdict{Decision: &decision}
+		}
+
+		verdict := walkVerdict{
+			Exclude:  true,
+			Decision: &decision,
+		}
+
+		if isDir {
+			verdict.PruneDir = decision.PruneDir
+		}
+
+		return verdict
+	}
+}
+
+// copyDir is the shared implementation of CopyDir and CopyDirFiltered.
+func copyDir(clone bool,
+	src string,
+	dst string,
+	copyRelPath bool,
+	skipErrors bool,
+	judge func(string, bool) walkVerdict,
+	ignoreDirNames map[string]struct{},
+	ignoreFileNames map[string]struct{}) (error, []error) {
+
 	if src == "" {
 		return ErrNoSrcDir, nil
 	}
@@ -1094,7 +1209,8 @@ func CopyDir(clone bool,
 
 	var errs []error
 	err = filepath.Walk(src, copyFileObjectHandler(
-		clone, src, dst, copyRelPath, skipErrors, excludePatterns, ignoreDirNames, ignoreFileNames, &errs))
+		clone, src, dst, copyRelPath, skipErrors,
+		judge, ignoreDirNames, ignoreFileNames, &errs))
 	if err != nil {
 		return err, nil
 	}

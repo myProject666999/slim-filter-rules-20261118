@@ -160,6 +160,7 @@ var CLI = &cli.Command{
 		cflag(FlagPathPermsFile),
 		//"EXCLUDE" FLAGS - START
 		cflag(FlagExcludePattern),
+		cflag(FlagFilterRulesFile),
 		cflag(FlagExcludeVarLockFiles),
 		cflag(FlagExcludeMounts),
 		//"EXCLUDE" FLAGS - END
@@ -500,6 +501,20 @@ var CLI = &cli.Command{
 
 		excludePatterns := command.ParsePaths(ctx.StringSlice(FlagExcludePattern))
 
+		// Rules from --filter-rules-file are converted into the same include
+		// and exclude maps the individual flags use, so they participate in the
+		// documented precedence rules. A bare pattern line is an exclude, which
+		// keeps plain pattern lists backward compatible.
+		rulesFileIncludes, err := parseFilterRulesFile(ctx.String(FlagFilterRulesFile), excludePatterns)
+		if err != nil {
+			xc.Out.Error("param.error.filter.rules.file", err.Error())
+			xc.Out.State("exited",
+				ovars{
+					"exit.code": -1,
+				})
+			xc.Exit(-1)
+		}
+
 		preservePaths := command.ParsePaths(ctx.StringSlice(FlagPreservePath))
 		morePreservePaths, err := command.ParsePathsFile(ctx.String(FlagPreservePathFile))
 		if err != nil {
@@ -557,6 +572,10 @@ var CLI = &cli.Command{
 			for k, v := range moreIncludePaths {
 				includePaths[k] = v
 			}
+		}
+
+		for k := range rulesFileIncludes {
+			includePaths[k] = nil
 		}
 
 		if len(includePaths) > 0 {
